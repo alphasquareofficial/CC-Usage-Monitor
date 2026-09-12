@@ -1,0 +1,27 @@
+# PlatformIO Build Directory & Libraries
+firmware/.pio/
+.pio/
+
+# VS Code / PlatformIO Config
+.vscode/
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Python PyInstaller Builds
+build/
+dist/
+*.spec
+host/build/
+host/dist/
+
+# Python Virtual Environments
+venv/
+env/
+.env
