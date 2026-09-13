@@ -13,29 +13,65 @@
 
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ I2C_SCL, /* data=*/ I2C_SDA, /* reset=*/ U8X8_PIN_NONE);
 
+// SH1106/SSD1306 panel geometry. Two things bite here:
+//  - u8g2 positions text by its BASELINE, so a baseline at SCREEN_H renders the
+//    glyphs entirely below the last visible row. The lowest safe baseline is
+//    SCREEN_H - 3, which leaves room for descenders.
+//  - SH1106 controllers drive 132 columns behind a 128px panel, and modules
+//    disagree about which columns are wired. Drawing inside a margin instead of
+//    hard against x=0 / x=127 keeps content on the glass either way.
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define MARGIN 4
+#define CONTENT_X0 MARGIN
+#define CONTENT_X1 (SCREEN_W - 1 - MARGIN)
+#define CONTENT_W (CONTENT_X1 - CONTENT_X0 + 1)
+#define HEADER_BASELINE 9
+#define FOOTER_BASELINE (SCREEN_H - 3)
+
 String hostIP = "";
-long total5hTokens = 0;
-long totalWeeklyTokens = 0;
+String str5h = "";
+String strWeekly = "";
+String reset5h = "";
+String resetWeekly = "";
+int pct5h = 0;
+int pctWeekly = 0;
+float progress5h = 0.0;
+float progressWeekly = 0.0;
 bool isActive = false;
 String statusMsg = "WiFi Setup Needed";
 
-long limit5h = 2500000;
-long limitWeekly = 10000000;
-
 unsigned long lastPollTime = 0;
 const unsigned long pollInterval = 5000;
+
+unsigned long lastResolveTime = 0;
+const unsigned long resolveInterval = 10000;
 
 int displayMode = 0; // 0=5h, 1=Weekly
 unsigned long lastDisplayModeChange = 0;
 const unsigned long displayModeInterval = 5000;
 
-String formatTokens(long tokens) {
-    if (tokens >= 1000000) {
-        return String(tokens / 1000000.0, 1) + "M";
-    } else if (tokens >= 1000) {
-        return String(tokens / 1000.0, 1) + "k";
-    }
-    return String(tokens);
+// Text helpers. Each measures the string with the CURRENT font and clamps the
+// result into the content area, so a string that turns out wider than expected
+// gets pinned to the left edge of the safe area instead of running off the
+// panel. Set the font before calling.
+static void drawClamped(const char *text, int x, int baseline) {
+    int w = u8g2.getStrWidth(text);
+    if (x + w > CONTENT_X1) x = CONTENT_X1 - w + 1;
+    if (x < CONTENT_X0) x = CONTENT_X0;
+    u8g2.drawStr(x, baseline, text);
+}
+
+static void drawLeft(const char *text, int baseline) {
+    drawClamped(text, CONTENT_X0, baseline);
+}
+
+static void drawRight(const char *text, int baseline) {
+    drawClamped(text, CONTENT_X1 - u8g2.getStrWidth(text) + 1, baseline);
+}
+
+static void drawCentered(const char *text, int baseline) {
+    drawClamped(text, CONTENT_X0 + (CONTENT_W - u8g2.getStrWidth(text)) / 2, baseline);
 }
 
 void drawClaudeBotScreensaver(unsigned long time_ms) {
@@ -82,82 +118,79 @@ void drawClaudeBotScreensaver(unsigned long time_ms) {
 
 void drawDashboard() {
     // If connected but idle, show the Claude Bot screensaver!
+    // However, show the usage dashboard for 5 seconds every 30 seconds.
     if (WiFi.status() == WL_CONNECTED && hostIP != "" && !isActive) {
-        drawClaudeBotScreensaver(millis());
-        return;
+        if ((millis() % 30000) > 5000) {
+            drawClaudeBotScreensaver(millis());
+            return;
+        }
     }
-    
+
     u8g2.clearBuffer();
-    
-    // Top Bar
+
+    // Everything is drawn inside CONTENT_X0..CONTENT_X1 rather than the full
+    // panel width. SH1106 controllers have 132 columns driving a 128px glass,
+    // and modules differ in which columns are wired up, so anything anchored
+    // hard against x=0 or x=127 can fall off the edge on some panels. The
+    // margin gives every edge-anchored element slack to absorb that.
+
+    // Header: which limit this screen is showing.
     u8g2.setFont(u8g2_font_helvB08_tr);
-    if (displayMode == 0) {
-        u8g2.drawStr(0, 10, "CLAUDE: 5H LIMIT");
-    } else {
-        u8g2.drawStr(0, 10, "CLAUDE: WEEKLY");
-    }
-    u8g2.drawLine(0, 13, 128, 13);
-    
+    const char *title = (displayMode == 0) ? "5-HOUR" : "WEEKLY";
+    drawCentered(title, HEADER_BASELINE);
+    u8g2.drawLine(CONTENT_X0, 12, CONTENT_X1, 12);
+
     if (WiFi.status() != WL_CONNECTED) {
         u8g2.setFont(u8g2_font_helvR08_tr);
-        u8g2.drawStr(0, 30, "Connect to AP:");
-        u8g2.drawStr(0, 42, "Claude-Monitor-Setup");
+        drawLeft("Connect to AP:", 30);
+        drawLeft("Claude-Monitor-Setup", 42);
     } else if (hostIP == "") {
         u8g2.setFont(u8g2_font_helvR08_tr);
-        u8g2.drawStr(0, 30, "Searching daemon...");
-        u8g2.drawStr(0, 42, "claudemonitor.local");
+        drawLeft("Searching daemon...", 30);
+        drawLeft("claudemonitor.local", 42);
     } else {
-        long currentTokens = (displayMode == 0) ? total5hTokens : totalWeeklyTokens;
-        long currentLimit = (displayMode == 0) ? limit5h : limitWeekly;
-        
-        String tokenStr = formatTokens(currentTokens) + " / " + formatTokens(currentLimit);
-        
-        u8g2.setFont(u8g2_font_helvB10_tr);
-        int strWidth = u8g2.getStrWidth(tokenStr.c_str());
-        u8g2.setCursor((128 - strWidth) / 2, 32);
-        u8g2.print(tokenStr);
-        
-        int barWidth = 110;
-        int barHeight = 12;
-        int barX = (128 - barWidth) / 2;
-        int barY = 40;
-        
-        float progress = (float)currentTokens / currentLimit;
-        if (progress > 1.0) progress = 1.0;
-        
-        u8g2.drawFrame(barX, barY, barWidth, barHeight);
-        int fillWidth = (barWidth - 4) * progress;
+        // Progress bar: the whole middle band, as large as the panel allows.
+        const int barY = 18;
+        const int barH = 29;             // spans y 18..46
+
+        float progress = (displayMode == 0) ? progress5h : progressWeekly;
+        if (progress < 0.0f) progress = 0.0f;
+        if (progress > 1.0f) progress = 1.0f;
+
+        u8g2.drawFrame(CONTENT_X0, barY, CONTENT_W, barH);
+        int fillWidth = (int)((CONTENT_W - 4) * progress);
         if (fillWidth > 0) {
-            u8g2.drawBox(barX + 2, barY + 2, fillWidth, barHeight - 4);
+            u8g2.drawBox(CONTENT_X0 + 2, barY + 2, fillWidth, barH - 4);
         }
     }
-    
-    // Footer
+
+    // Footer: live/idle on the left, percentage centred, reset countdown right.
     if (WiFi.status() == WL_CONNECTED && hostIP != "") {
         u8g2.setFont(u8g2_font_profont10_tr);
-        if (isActive) {
-            u8g2.drawStr(0, 64, "LIVE");
-        } else {
-            u8g2.drawStr(0, 64, "IDLE");
-        }
-        
-        long currentTokens = (displayMode == 0) ? total5hTokens : totalWeeklyTokens;
-        long currentLimit = (displayMode == 0) ? limit5h : limitWeekly;
-        int pct = (currentTokens * 100) / currentLimit;
+        drawLeft(isActive ? "LIVE" : "IDLE", FOOTER_BASELINE);
+
+        int pct = (displayMode == 0) ? pct5h : pctWeekly;
         String pctStr = String(pct) + "%";
-        int pctWidth = u8g2.getStrWidth(pctStr.c_str());
-        u8g2.setCursor(128 - pctWidth, 64);
-        u8g2.print(pctStr);
+        drawCentered(pctStr.c_str(), FOOTER_BASELINE);
+
+        String resetStr = (displayMode == 0) ? reset5h : resetWeekly;
+        if (resetStr.length() > 0) {
+            drawRight(resetStr.c_str(), FOOTER_BASELINE);
+        }
     } else {
         u8g2.setFont(u8g2_font_profont10_tr);
-        u8g2.drawStr(0, 64, statusMsg.c_str());
+        drawLeft(statusMsg.c_str(), FOOTER_BASELINE);
     }
-    
+
     u8g2.sendBuffer();
 }
 
 void resolveHost() {
     if (hostIP != "") return;
+    // MDNS.queryHost() blocks while it waits, so don't retry it on every
+    // loop pass or the UI freezes for as long as the daemon is unreachable.
+    if (lastResolveTime != 0 && millis() - lastResolveTime < resolveInterval) return;
+    lastResolveTime = millis();
     
     Serial.println("Resolving claudemonitor.local...");
     IPAddress serverIP = MDNS.queryHost("claudemonitor");
@@ -176,6 +209,8 @@ void pollData() {
     HTTPClient http;
     String url = "http://" + hostIP + ":8080/stats";
     http.begin(url);
+    http.setConnectTimeout(2000);
+    http.setTimeout(3000);
     
     int httpCode = http.GET();
     if (httpCode == 200) {
@@ -184,10 +219,14 @@ void pollData() {
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, payload);
         if (!error) {
-            total5hTokens = doc["5h_total"] | 0;
-            totalWeeklyTokens = doc["weekly_total"] | 0;
-            limit5h = doc["limit_5h"] | 2500000;
-            limitWeekly = doc["limit_weekly"] | 10000000;
+            str5h = doc["str_5h"] | "";
+            strWeekly = doc["str_weekly"] | "";
+            reset5h = doc["reset_str_5h"] | "";
+            resetWeekly = doc["reset_str_weekly"] | "";
+            pct5h = doc["pct_5h"] | 0;
+            pctWeekly = doc["pct_weekly"] | 0;
+            progress5h = doc["progress_5h"] | 0.0f;
+            progressWeekly = doc["progress_weekly"] | 0.0f;
             isActive = doc["active"] | false;
         } else {
             Serial.println("JSON Parse Error");
